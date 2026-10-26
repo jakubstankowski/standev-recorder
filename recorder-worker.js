@@ -14,9 +14,16 @@ const WARMUP_TIMEOUT_MS = 10000;
 
 let canvas, ctx, opts, timer, statsTimer, previewTimer;
 let videoEncoder, audioEncoder, muxer, fileStream, memParts;
-let t0, paused = false, pauseStart = 0, pausedTotal = 0, frameNo = 0, audioSamples = 0;
+let t0, paused = false, pauseStart = 0, pausedTotal = 0, audioSamples = 0;
 let previewOn = true, previewPending = false, stopping = false, vcfg, lastOutputAt = 0, encoderRestarts = 0;
-let decoderConfig = null, muxedFirst = false, warmFed = 0, warmOut = 0, tsBase = 0;
+let decoderConfig = null, muxedFirst = false, tsBase = 0;
+// Klatki o czasie mniejszym niż realStartTs to rozgrzewka enkodera i nie trafiają do pliku
+let realStartTs = Infinity;
+// awaitingKey: nowy enkoder musi zacząć od klatki kluczowej, inaczej obraz „rozjeżdża się”
+// (klatki różnicowe odwołują się do obrazu, którego w pliku nie ma)
+let awaitingKey = true, needKey = true, lastKeyAt = 0;
+// Kodujemy tylko, gdy obraz się zmienił (dirty), i nie częściej niż co minInterval ms
+let dirty = true, lastEncodeAt = 0, minInterval = 0, overloadSecs = 0;
 const latest = { screen: null, cam: null };
 const counts = { screen: 0, cam: 0, out: 0, dropped: 0, encoded: 0, queueMax: 0 };
 const readers = [];
@@ -75,6 +82,7 @@ function attachVideo(key, readable) {
       if (sources[key] !== src) { value.close(); continue; } // klatka ze starego, wymienionego strumienia
       latest[key]?.close();
       latest[key] = value;
+      dirty = true;
       src.lastAt = performance.now();
       counts[key]++;
     }
@@ -90,7 +98,7 @@ function sourceLost(key, reason) {
   src.reader.cancel().catch(() => {});
   // Ekran może legalnie stać w miejscu, więc jego ostatnia klatka zostaje. Kamerkę chowamy,
   // żeby w nagraniu nie było stopklatki udającej obraz na żywo.
-  if (key === 'cam') { latest.cam?.close(); latest.cam = null; }
+  if (key === 'cam') { latest.cam?.close(); latest.cam = null; dirty = true; }
   postMessage({ type: 'source-lost', key, reason });
 }
 
@@ -135,6 +143,13 @@ function drawCamBubble(k, W, H) {
 }
 
 function tick() {
+  const tNow = performance.now();
+  // Nic się nie zmieniło (kamerka 30 kl./s przy nagraniu 60, nieruchomy ekran): nie kodujemy
+  // duplikatu. Raz na sekundę i tak wysyłamy klatkę, żeby odtwarzacze miały ciągłość.
+  if (!dirty && tNow - lastEncodeAt < 1000) return;
+  // Przy przeciążeniu limit klatek jest obniżony (adaptacja niżej): czekamy na kolejny tick
+  // (tolerancja pół taktu, bo timer nie trafia idealnie: bez niej 30 kl./s dawało ok. 24)
+  if (!paused && tNow - lastEncodeAt < minInterval - 500 / opts.fps) return;
   const W = canvas.width, H = canvas.height;
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, W, H);
@@ -151,10 +166,13 @@ function tick() {
   // go karmić przy długiej kolejce, oba czekałyby na siebie bez końca (zawieszone nagranie).
   const encoderAlive = performance.now() - lastOutputAt < 250;
   if (queue > MAX_QUEUE * 4 || (queue > MAX_QUEUE && encoderAlive)) { counts.dropped++; return; }
+  const keyFrame = needKey || tNow - lastKeyAt >= KEYFRAME_SEC * 1000;
   const frame = new VideoFrame(canvas, { timestamp: tsBase + Math.round(now() * 1000) });
-  videoEncoder.encode(frame, { keyFrame: frameNo % (opts.fps * KEYFRAME_SEC) === 0 });
+  videoEncoder.encode(frame, { keyFrame });
   frame.close();
-  frameNo++;
+  if (keyFrame) { needKey = false; lastKeyAt = tNow; }
+  dirty = false;
+  lastEncodeAt = tNow;
   counts.out++;
 }
 
@@ -192,9 +210,13 @@ function createVideoEncoder() {
     output: (chunk, meta) => {
       lastOutputAt = performance.now();
       if (meta?.decoderConfig) decoderConfig = meta.decoderConfig;
-      // Klatki z rozgrzewki nie trafiają do pliku. Enkoder w trybie realtime oddaje klatki
-      // po kolei, więc odrzucamy tyle pierwszych wyników, ile klatek rozgrzewkowych podano.
-      if (warmOut < warmFed) { warmOut++; return; }
+      // Rozgrzewkę rozpoznajemy po czasie, nie po liczbie klatek: enkoder w trybie realtime
+      // sam pomija klatki pod obciążeniem, więc liczenie wyrzucało też prawdziwe klatki
+      if (chunk.timestamp < realStartTs) return;
+      if (awaitingKey) {
+        if (chunk.type !== 'key') { needKey = true; return; }
+        awaitingKey = false;
+      }
       if (!muxedFirst) {
         muxedFirst = true;
         if (!meta?.decoderConfig) meta = { ...meta, decoderConfig };
@@ -206,8 +228,24 @@ function createVideoEncoder() {
     error: (e) => { console.warn('Enkoder wideo:', e); restartVideoEncoder(); },
   });
   videoEncoder.configure(vcfg);
-  warmFed = warmOut = 0;
-  frameNo = 0; // pierwsza klatka nowego enkodera musi być kluczowa
+  awaitingKey = needKey = true; // pierwsza klatka nowego enkodera musi być kluczowa
+}
+
+// Enkoder nie nadąża przez 2 s: zamiast gubić losowe klatki (szarpany obraz) przechodzimy
+// na równe, niższe FPS. Równe 30 kl./s wygląda dużo płynniej niż „60” z dziurami.
+function adaptFrameRate() {
+  if (paused) return;
+  const fpsNow = minInterval ? Math.round(1000 / minInterval) : opts.fps;
+  overloadSecs = counts.dropped > fpsNow * 0.1 ? overloadSecs + 1 : 0;
+  if (overloadSecs < 2) return;
+  overloadSecs = 0;
+  const next = fpsNow > 30 ? 30 : fpsNow > 20 ? 20 : fpsNow > 15 ? 15 : null;
+  if (!next) {
+    postMessage({ type: 'overload', fps: fpsNow, dropped: counts.dropped });
+    return;
+  }
+  minInterval = 1000 / next;
+  postMessage({ type: 'adapt', from: fpsNow, fps: next });
 }
 
 function restartVideoEncoder() {
@@ -234,13 +272,13 @@ async function warmUpEncoder() {
       const f = new VideoFrame(canvas, { timestamp: i * 16667 });
       videoEncoder.encode(f, { keyFrame: i === 0 });
       f.close();
-      warmFed++;
       i++;
     }
     await new Promise((r) => setTimeout(r, 1000 / opts.fps));
   }
-  frameNo = 0; // pierwsza prawdziwa klatka będzie kluczowa
-  tsBase = i * 16667; // czas nagrania ciągnie się dalej od rozgrzewki (muxer i tak przesuwa plik do zera)
+  // Czas nagrania ciągnie się dalej od rozgrzewki (muxer i tak przesuwa plik do zera)
+  realStartTs = tsBase = i * 16667;
+  awaitingKey = needKey = true; // pierwsza prawdziwa klatka będzie kluczowa
 }
 
 // Obietnica z limitem czasu: zawieszony enkoder nie może zablokować zapisu pliku
@@ -309,6 +347,7 @@ async function start(d) {
     }
     // Enkoder nic nie wydał od kilku sekund mimo podawania klatek: tworzymy go od nowa
     if (!paused && performance.now() - lastOutputAt > ENCODER_STALL_MS) restartVideoEncoder();
+    adaptFrameRate();
     postMessage({ type: 'stats', ...counts, bytes });
     for (const k in counts) counts[k] = 0;
   }, 1000);
@@ -361,7 +400,7 @@ async function stop() {
 onmessage = ({ data }) => {
   const run = (p) => p.catch(fail);
   if (data.type === 'start') run(start(data));
-  else if (data.type === 'opts') Object.assign(opts, data.opts);
+  else if (data.type === 'opts') { Object.assign(opts, data.opts); dirty = true; }
   else if (data.type === 'source') attachVideo(data.key, data.readable);
   else if (data.type === 'preview') previewOn = data.on;
   else if (data.type === 'preview-ack') previewPending = false;

@@ -408,7 +408,8 @@ async function startRecording() {
       camStream = await navigator.mediaDevices.getUserMedia({
         video: {
           deviceId: $('camDevice').value ? { exact: $('camDevice').value } : undefined,
-          width: { ideal: big ? 3840 : 1920 }, height: { ideal: big ? 2160 : 1080 }, frameRate: { ideal: fps },
+          // 30 kl./s: większość kamerek przy 60 obniża rozdzielczość albo gubi klatki w słabym świetle
+          width: { ideal: big ? 3840 : 1920 }, height: { ideal: big ? 2160 : 1080 }, frameRate: { ideal: Math.min(fps, 30) },
         },
       });
       streams.push(camStream);
@@ -552,7 +553,13 @@ async function launchRecording({ screenStream, camStream, micStream, streams, fp
       rec.stats = data;
       (rec.statsLog ||= []).push(data);
       if (data.cam) rec.camProblem = null;
-      checkOverload(data);
+    }
+    else if (data.type === 'adapt') {
+      rec.fpsCap = data.fps;
+      setWarning(`Komputer nie nadążał z ${data.from} kl./s, więc nagranie przeszło automatycznie na równe ${data.fps} kl./s. Obraz będzie płynny, bez szarpania.`);
+    }
+    else if (data.type === 'overload') {
+      setWarning(`Komputer nie nadąża nawet przy ${data.fps} kl./s. Przy następnym nagraniu wybierz rozdzielczość „Natywna źródła” (bez powiększania) albo niższy bitrate.`);
     }
     else if (data.type === 'source-lost') {
       if (data.key === 'cam') restartCam(data.reason);
@@ -598,16 +605,6 @@ async function launchRecording({ screenStream, camStream, micStream, streams, fp
   rec.timerId = setInterval(updateTimer, 250);
 }
 
-// Przeciążenie: przez 3 sekundy z rzędu pominięto ponad 10% klatek
-function checkOverload(s) {
-  const fps = Number($('optFps').value);
-  rec.overloadSecs = s.dropped > fps * 0.1 ? (rec.overloadSecs || 0) + 1 : 0;
-  if (rec.overloadSecs === 3) {
-    const hint = fps > 30 ? 'zmniejsz FPS do 30' : 'zmniejsz rozdzielczość albo bitrate';
-    setWarning(`Komputer nie nadąża: pomijanych jest ok. ${s.dropped} klatek na sekundę. Przy następnym nagraniu ${hint}.`);
-  }
-}
-
 function updateTimer() {
   if (!rec?.started) return;
   const now = rec.pausedAt || performance.now();
@@ -624,7 +621,8 @@ function updateTimer() {
     rec.srcInfo.screen && `ekran ${rec.srcInfo.screen}${rec.srcInfo.upscaled ? ' <span class="text-sun">(powiększany)</span>' : ''}`,
     rec.srcInfo.cam && `kamerka ${rec.srcInfo.cam}`,
   ].filter(Boolean).join(' · ');
-  ui.liveInfo.innerHTML = `${rec.out.w}×${rec.out.h} · ${s.out} fps · ${fmtBytes(s.bytes)}${camInfo}<br>${src}<br>${rec.fileHandle ? 'zapis na dysk na żywo' : 'w pamięci, pobranie po Stop'} · H.264 ${hw}`;
+  const cap = rec.fpsCap ? ` <span class="text-sun">(limit ${rec.fpsCap})</span>` : '';
+  ui.liveInfo.innerHTML = `${rec.out.w}×${rec.out.h} · nagranie ${s.out} kl./s${cap} · ${fmtBytes(s.bytes)}${camInfo}<br>${src}<br>${rec.fileHandle ? 'zapis na dysk na żywo' : 'w pamięci, pobranie po Stop'} · H.264 ${hw}`;
 }
 
 function togglePause() {
