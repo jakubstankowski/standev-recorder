@@ -59,8 +59,7 @@
       <!-- Podgląd -->
       <section class="overflow-hidden rounded-2xl border border-white/5 bg-ink">
         <div class="relative aspect-video bg-black">
-          <canvas id="canvas" class="hidden h-full w-full object-contain"></canvas>
-          <video id="directPreview" class="hidden h-full w-full object-contain" muted playsinline></video>
+          <canvas id="livePreview" class="hidden h-full w-full object-contain"></canvas>
           <video id="playback" class="hidden h-full w-full object-contain" controls playsinline></video>
           <div id="placeholder" class="absolute inset-0 grid place-items-center p-6 text-center">
             <div>
@@ -82,10 +81,22 @@
           </button>
           <div id="liveInfo" class="ml-auto text-right font-mono text-xs text-gray-400"></div>
         </div>
+        <div id="warning" class="hidden border-t border-sun/30 bg-sun/10 px-4 py-3 text-sm font-semibold text-sun"></div>
       </section>
 
       <!-- Ustawienia -->
       <aside class="space-y-4">
+        <div class="rounded-2xl border border-white/5 bg-ink p-5">
+          <h2 class="mb-3 text-sm font-extrabold uppercase tracking-wider text-brand-light">Tryb</h2>
+          <div id="presets" class="grid grid-cols-2 gap-2 text-sm font-bold">
+            <button data-preset="presentation" class="rounded-lg border border-white/10 bg-ink-2 px-3 py-2 transition hover:border-brand/60">Prezentacja</button>
+            <button data-preset="screencam" class="rounded-lg border border-white/10 bg-ink-2 px-3 py-2 transition hover:border-brand/60">Ekran z kamerą</button>
+            <button data-preset="cam" class="rounded-lg border border-white/10 bg-ink-2 px-3 py-2 transition hover:border-brand/60">Sama kamera</button>
+            <button data-preset="custom" class="rounded-lg border border-white/10 bg-ink-2 px-3 py-2 transition hover:border-brand/60">Własne</button>
+          </div>
+          <p id="presetInfo" class="mt-2 text-xs text-gray-400"></p>
+        </div>
+
         <div class="rounded-2xl border border-white/5 bg-ink p-5">
           <h2 class="mb-4 text-sm font-extrabold uppercase tracking-wider text-brand-light">Źródła</h2>
           <div class="space-y-3">
@@ -144,11 +155,12 @@
           <div class="grid grid-cols-2 gap-3 text-sm">
             <label class="col-span-2">Rozdzielczość
               <select id="optRes" class="mt-1 w-full rounded-lg border border-white/10 bg-ink-2 px-3 py-2">
-                <option value="min1440" selected>Natywna, min. 2K (1440p)</option>
-                <option value="1440">2K (1440p)</option>
-                <option value="2160">4K (2160p)</option>
-                <option value="native">Natywna ekranu</option>
+                <option value="native" selected>Natywna źródła (zalecane)</option>
+                <option value="min1440">Powiększ do min. 2K (1440p)</option>
+                <option value="1440">Zawsze 2K (1440p)</option>
+                <option value="2160">Zawsze 4K (2160p)</option>
               </select>
+              <span class="mt-1 block text-xs text-gray-500">Powiększanie daje więcej pikseli w pliku, ale nie więcej szczegółów.</span>
             </label>
             <label>FPS
               <select id="optFps" class="mt-1 w-full rounded-lg border border-white/10 bg-ink-2 px-3 py-2">
@@ -184,26 +196,17 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const ui = {
-  canvas: $('canvas'), directPreview: $('directPreview'), playback: $('playback'), placeholder: $('placeholder'),
+  livePreview: $('livePreview'), playback: $('playback'), placeholder: $('placeholder'),
   start: $('btnStart'), pause: $('btnPause'), stop: $('btnStop'),
   statusDot: $('statusDot'), statusText: $('statusText'), timer: $('timer'), liveInfo: $('liveInfo'),
 };
 
-// ---------- Format ----------
-const MIME_CANDIDATES = [
-  'video/mp4;codecs=avc1.640033,mp4a.40.2',
-  'video/mp4;codecs=avc1.640033,opus',
-  'video/mp4;codecs=avc1,mp4a.40.2',
-  'video/mp4',
-  'video/webm;codecs=h264,opus',
-  'video/webm;codecs=vp9,opus',
-  'video/webm',
-];
-const mimeType = MIME_CANDIDATES.find((m) => window.MediaRecorder && MediaRecorder.isTypeSupported(m)) || '';
-const ext = mimeType.startsWith('video/mp4') ? 'mp4' : 'webm';
-$('formatInfo').textContent = ext === 'mp4'
-  ? `Format: MP4 (H.264). Kodek: ${mimeType.split('codecs=')[1] || 'domyślny'}`
-  : 'Ta przeglądarka nie nagrywa MP4. Plik zapisze się jako WebM. Użyj aktualnego Chrome lub Edge.';
+// ---------- Obsługa przeglądarki ----------
+// Kodowanie odbywa się w recorder-worker.js (WebCodecs), co wymaga Chrome albo Edge
+const supported = 'VideoEncoder' in window && 'AudioEncoder' in window && 'MediaStreamTrackProcessor' in window;
+$('formatInfo').textContent = supported
+  ? 'Format: MP4 (H.264 + AAC), kodowanie sprzętowe w osobnym wątku.'
+  : 'Ta przeglądarka nie obsługuje nagrywania. Użyj aktualnego Chrome albo Edge.';
 
 // ---------- Folder zapisu (File System Access API, zapis prosto na dysk = brak limitu RAM) ----------
 let dirHandle = null;
@@ -285,11 +288,12 @@ function syncOptionUI() {
 $('camSize').oninput = () => { $('camSizeVal').textContent = $('camSize').value + '%'; };
 
 // ---------- Stan nagrywania ----------
-let rec = null; // { recorder, streams, writable, chunks, ... }
+let rec = null; // { worker, streams, audioCtx, fileHandle, name, stats, ... }
 
 function setStatus(kind) {
   const map = {
     idle: ['bg-gray-500', 'Gotowy'],
+    starting: ['bg-sky rec-dot', 'Uruchamianie…'],
     rec: ['bg-coral rec-dot', 'Nagrywanie'],
     paused: ['bg-sun', 'Pauza'],
     saving: ['bg-sky rec-dot', 'Zapisywanie…'],
@@ -317,35 +321,57 @@ function targetSize(nativeW, nativeH, mode) {
   return { w: even(h * ratio), h: even(h) };
 }
 
-// Ticker w Web Workerze: działa także, gdy karta jest w tle (rAF i setInterval w tle są dławione)
-function makeTicker(fps) {
-  const src = `let t; onmessage = (e) => { clearInterval(t); if (e.data > 0) t = setInterval(() => postMessage(0), 1000 / e.data); };`;
-  const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
-  w.postMessage(fps);
-  return w;
+// ---------- Tryby (presety) ----------
+const PRESETS = {
+  presentation: { info: 'Ekran bez kamerki, 30 fps. Ostry tekst, mniejsze pliki.', screen: true, cam: false, res: 'native', fps: '30', bitrate: '25' },
+  screencam: { info: 'Ekran z kamerką w rogu, 60 fps.', screen: true, cam: true, res: 'native', fps: '60', bitrate: '50' },
+  cam: { info: 'Sama kamerka na cały kadr, w jej najwyższej rozdzielczości.', screen: false, cam: true, res: 'native', fps: '30', bitrate: '25' },
+};
+let applyingPreset = false;
+function markPreset(key) {
+  document.querySelectorAll('#presets button').forEach((b) => {
+    const on = b.dataset.preset === key;
+    b.classList.toggle('border-brand', on);
+    b.classList.toggle('bg-brand/15', on);
+    b.classList.toggle('text-white', on);
+  });
+  $('presetInfo').textContent = PRESETS[key]?.info || 'Ustawienia ręczne.';
 }
-
-// Bierze klatki prosto z tracka (działa w tle). Fallback: element <video>.
-function frameSource(track) {
-  if ('MediaStreamTrackProcessor' in window) {
-    const src = { frame: null, stopped: false };
-    const reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
-    (async () => {
-      while (!src.stopped) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        src.frame?.close();
-        src.frame = value;
-      }
-    })().catch(() => {});
-    src.get = () => src.frame && { img: src.frame, w: src.frame.displayWidth, h: src.frame.displayHeight };
-    src.stop = () => { src.stopped = true; reader.cancel().catch(() => {}); src.frame?.close(); src.frame = null; };
-    return src;
+function applyPreset(key) {
+  const p = PRESETS[key];
+  if (p) {
+    applyingPreset = true;
+    $('optScreen').checked = p.screen;
+    $('optCam').checked = p.cam;
+    $('optRes').value = p.res;
+    $('optFps').value = p.fps;
+    $('optBitrate').value = p.bitrate;
+    ['optScreen', 'optCam'].forEach((id) => $(id).dispatchEvent(new Event('change')));
+    applyingPreset = false;
   }
-  const v = document.createElement('video');
-  v.muted = true; v.playsInline = true; v.srcObject = new MediaStream([track]); v.play();
-  return { get: () => v.videoWidth && { img: v, w: v.videoWidth, h: v.videoHeight }, stop: () => { v.srcObject = null; } };
+  markPreset(key);
 }
+document.querySelectorAll('#presets button').forEach((b) => { b.onclick = () => applyPreset(b.dataset.preset); });
+// Ręczna zmiana któregoś ustawienia przełącza na „Własne”
+['optScreen', 'optCam', 'optRes', 'optFps', 'optBitrate'].forEach((id) => $(id).addEventListener('change', () => {
+  if (!applyingPreset) markPreset('custom');
+}));
+
+function camOpts() {
+  return {
+    camPos: $('camPos').value,
+    camShape: $('camShape').value,
+    camMirror: $('camMirror').value === '1',
+    camSize: Number($('camSize').value),
+  };
+}
+['camPos', 'camShape', 'camMirror', 'camSize'].forEach((id) => $(id).addEventListener('input', () => {
+  rec?.worker.postMessage({ type: 'opts', opts: camOpts() });
+}));
+// Podgląd jest potrzebny tylko, gdy karta jest widoczna; w tle nie zapychamy głównego wątku
+document.addEventListener('visibilitychange', () => {
+  rec?.worker.postMessage({ type: 'preview', on: !document.hidden });
+});
 
 async function startRecording() {
   const wantScreen = $('optScreen').checked;
@@ -358,6 +384,7 @@ async function startRecording() {
 
   const streams = [];
   let screenStream = null, camStream = null, micStream = null;
+  const stopAll = () => streams.forEach((s) => s.getTracks().forEach((t) => t.stop()));
   try {
     if (wantScreen) {
       screenStream = await navigator.mediaDevices.getDisplayMedia({
@@ -368,18 +395,39 @@ async function startRecording() {
         surfaceSwitching: 'include',
       });
       streams.push(screenStream);
-      const vt = screenStream.getVideoTracks()[0];
-      vt.contentHint = 'detail'; // ostry tekst zamiast rozmytego ruchu
+      screenStream.getVideoTracks()[0].contentHint = 'detail'; // ostry tekst zamiast rozmytego ruchu
     }
+  } catch (e) {
+    if (e.name !== 'NotAllowedError') alert('Nie udało się przechwycić ekranu: ' + e.message);
+    return;
+  }
+  try {
     if (wantCam) {
+      // Kamerka dostaje FPS nagrania; przy 4K albo samej kamerce prosimy o jej najwyższą rozdzielczość
+      const big = resMode === '2160' || !wantScreen;
       camStream = await navigator.mediaDevices.getUserMedia({
         video: {
           deviceId: $('camDevice').value ? { exact: $('camDevice').value } : undefined,
-          width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 },
+          width: { ideal: big ? 3840 : 1920 }, height: { ideal: big ? 2160 : 1080 }, frameRate: { ideal: fps },
         },
       });
       streams.push(camStream);
     }
+  } catch (e) {
+    const why = {
+      NotAllowedError: 'brak zgody na kamerkę (kliknij ikonę kamery w pasku adresu i zezwól)',
+      NotReadableError: 'kamerka jest zajęta przez inną aplikację (Teams, Zoom, OBS…)',
+      NotFoundError: 'nie znaleziono kamerki',
+      OverconstrainedError: 'wybrana kamerka jest niedostępna, wybierz inną z listy',
+    }[e.name] || e.message;
+    // Awaria kamerki nie musi blokować nagrania ekranu
+    if (!wantScreen || !confirm(`Nie udało się włączyć kamerki: ${why}.\n\nNagrywać sam ekran bez kamerki?`)) {
+      stopAll();
+      if (!wantScreen) alert('Nie udało się włączyć kamerki: ' + why);
+      return;
+    }
+  }
+  try {
     if (wantMic) {
       micStream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -390,197 +438,235 @@ async function startRecording() {
       streams.push(micStream);
     }
   } catch (e) {
-    streams.forEach((s) => s.getTracks().forEach((t) => t.stop()));
-    if (e.name !== 'NotAllowedError') alert('Nie udało się uruchomić źródeł: ' + e.message);
-    return;
+    if (!confirm(`Nie udało się włączyć mikrofonu: ${e.message}.\n\nNagrywać bez mikrofonu?`)) {
+      stopAll();
+      return;
+    }
   }
   listDevices();
 
+  const res = {}; // zasoby tworzone przy starcie, do posprzątania, gdy coś pójdzie nie tak
+  try {
+    await launchRecording({ screenStream, camStream, micStream, streams, fps, resMode }, res);
+  } catch (e) {
+    // Sprzątanie po nieudanym starcie: urządzenia, dźwięk, worker i pusty plik
+    console.error('Start nagrywania:', e);
+    stopAll();
+    res.audioCtx?.close();
+    res.worker?.terminate();
+    if (res.fileHandle) await dirHandle.removeEntry(res.name).catch(() => {});
+    rec = null;
+    resetUI();
+    alert('Nie udało się rozpocząć nagrywania: ' + e.message);
+  }
+}
+
+function resetUI() {
+  setStatus('idle');
+  setWarning(null);
+  ui.livePreview.classList.add('hidden');
+  if (ui.playback.classList.contains('hidden')) ui.placeholder.classList.remove('hidden');
+  ui.start.disabled = false; ui.pause.disabled = true; ui.stop.disabled = true;
+}
+
+function setWarning(text) {
+  $('warning').textContent = text || '';
+  $('warning').classList.toggle('hidden', !text);
+}
+
+async function launchRecording({ screenStream, camStream, micStream, streams, fps, resMode }, res) {
   // --- Wideo ---
   const screenTrack = screenStream?.getVideoTracks()[0];
-  const nativeSettings = screenTrack ? screenTrack.getSettings() : camStream.getVideoTracks()[0].getSettings();
+  const camTrack = camStream?.getVideoTracks()[0];
+  const nativeSettings = (screenTrack || camTrack).getSettings();
   const out = targetSize(nativeSettings.width || 1920, nativeSettings.height || 1080, resMode);
-  const direct = screenTrack && !camStream && out.w === nativeSettings.width && out.h === nativeSettings.height;
 
-  let videoTrack, ticker = null, sources = [];
-  ui.placeholder.classList.add('hidden');
-  ui.playback.classList.add('hidden');
-  ui.playback.pause();
-
-  if (direct) {
-    // Bez kamerki i bez skalowania: nagrywamy oryginalny strumień ekranu, 1:1
-    videoTrack = screenTrack;
-    ui.directPreview.srcObject = new MediaStream([screenTrack]);
-    ui.directPreview.classList.remove('hidden');
-    ui.directPreview.play();
-  } else {
-    const c = ui.canvas;
-    c.width = out.w; c.height = out.h;
-    c.classList.remove('hidden');
-    const ctx = c.getContext('2d', { alpha: false });
-    ctx.imageSmoothingEnabled = true;
-    ctx.imageSmoothingQuality = 'high';
-    const scr = screenTrack ? frameSource(screenTrack) : null;
-    const cam = camStream ? frameSource(camStream.getVideoTracks()[0]) : null;
-    sources = [scr, cam].filter(Boolean);
-
-    const draw = () => {
-      ctx.fillStyle = '#000';
-      ctx.fillRect(0, 0, out.w, out.h);
-      const s = scr?.get();
-      if (s) drawContain(ctx, s, 0, 0, out.w, out.h);
-      const k = cam?.get();
-      if (k) {
-        if (!scr) drawCover(ctx, k, 0, 0, out.w, out.h, $('camMirror').value === '1');
-        else drawCamBubble(ctx, k, out.w, out.h);
-      }
-    };
-    ticker = makeTicker(fps);
-    ticker.onmessage = draw;
-    videoTrack = c.captureStream(fps).getVideoTracks()[0];
-  }
-
-  // --- Audio: mieszanie dźwięku systemowego i mikrofonu ---
+  // --- Audio: dźwięk systemowy i mikrofon zawsze przez AudioContext (stałe 48 kHz stereo) ---
   const audioInputs = [screenStream, micStream].filter((s) => s && s.getAudioTracks().length);
   let audioCtx = null, audioTrack = null;
-  if (audioInputs.length === 1) {
-    audioTrack = audioInputs[0].getAudioTracks()[0];
-  } else if (audioInputs.length > 1) {
-    audioCtx = new AudioContext({ sampleRate: 48000 });
+  if (audioInputs.length) {
+    audioCtx = res.audioCtx = new AudioContext({ sampleRate: 48000 });
     const dest = audioCtx.createMediaStreamDestination();
+    dest.channelCount = 2;
     audioInputs.forEach((s) => audioCtx.createMediaStreamSource(s).connect(dest));
     audioTrack = dest.stream.getAudioTracks()[0];
   }
-  if (wantSys && screenStream && !screenStream.getAudioTracks().length) {
-    console.info('Dźwięk systemowy nie został udostępniony w oknie wyboru ekranu.');
-  }
-
-  const recStream = new MediaStream([videoTrack, audioTrack].filter(Boolean));
-  const recorder = new MediaRecorder(recStream, {
-    mimeType: mimeType || undefined,
-    videoBitsPerSecond: Number($('optBitrate').value) * 1_000_000,
-    audioBitsPerSecond: 320_000,
-  });
 
   // --- Cel zapisu ---
-  const name = `nagranie-${new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-')}.${ext}`;
-  let writable = null, fileHandle = null;
+  const name = res.name = `nagranie-${new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-')}.mp4`;
+  let fileHandle = null;
   if (dirHandle && (await dirHandle.queryPermission({ mode: 'readwrite' })) === 'granted') {
-    try {
-      fileHandle = await dirHandle.getFileHandle(name, { create: true });
-      writable = await fileHandle.createWritable();
-    } catch (e) { console.warn('Zapis do folderu niedostępny, używam pobierania:', e); }
+    try { fileHandle = res.fileHandle = await dirHandle.getFileHandle(name, { create: true }); }
+    catch (e) { console.warn('Zapis do folderu niedostępny, używam pobierania:', e); }
   }
 
+  // --- Worker: składanie, kodowanie i zapis poza głównym wątkiem ---
+  const worker = res.worker = new Worker('recorder-worker.js');
+  // Mały bufor dla obrazu: stare klatki są porzucane, zamiast blokować pulę buforów kamerki
+  // (zablokowana pula = kamerka przestaje nadawać po chwili)
+  const readable = (track, maxBufferSize) => track && new MediaStreamTrackProcessor({ track, maxBufferSize }).readable;
+  const screen = readable(screenTrack, 2), cam = readable(camTrack, 1), audio = readable(audioTrack);
+  worker.postMessage({
+    type: 'start', width: out.w, height: out.h, fps,
+    bitrate: Number($('optBitrate').value) * 1_000_000,
+    screen, cam, audio, audioInfo: { sampleRate: 48000, channels: 2 }, fileHandle,
+    opts: { ...camOpts(), hasScreen: !!screenTrack },
+  }, [screen, cam, audio].filter(Boolean));
+
+  const camSet = camTrack?.getSettings();
   rec = {
-    recorder, streams, sources, ticker, audioCtx, writable, fileHandle, name,
-    chunks: [], bytes: 0, writeQueue: Promise.resolve(),
-    startedAt: performance.now(), pausedMs: 0, pausedAt: 0, out, direct,
+    worker, streams, audioCtx, fileHandle, name, out, hasCam: !!camTrack, stats: null, codec: null,
+    startedAt: performance.now(), pausedMs: 0, pausedAt: 0,
+    camTrack, camClones: [], camRestarts: 0, camProblem: null,
+    srcInfo: {
+      screen: screenTrack && nativeSettings.width && `${nativeSettings.width}×${nativeSettings.height}`,
+      upscaled: !!nativeSettings.height && out.h > nativeSettings.height,
+      cam: camSet?.width && `${camSet.width}×${camSet.height} @${Math.round(camSet.frameRate || 0)}`,
+    },
   };
 
-  recorder.ondataavailable = (e) => {
-    if (!e.data.size) return;
-    rec.bytes += e.data.size;
-    if (rec.writable) rec.writeQueue = rec.writeQueue.then(() => rec.writable.write(e.data));
-    else rec.chunks.push(e.data);
+  // Kamerka przestała nadawać: podłączamy ją od nowa (klon tej samej ścieżki) zamiast stopklatki
+  const restartCam = (reason) => {
+    const r = rec;
+    if (!r || r.stopping) return;
+    if (r.camTrack.readyState !== 'live' || r.camRestarts >= 30) {
+      r.camProblem = 'kamerka odłączona';
+      console.warn('Kamerka odłączona:', reason);
+      return;
+    }
+    r.camRestarts++;
+    r.camProblem = `ponowne podłączanie (${reason})`;
+    console.warn(`Kamerka: ${reason}, ponowne podłączenie #${r.camRestarts}`);
+    const clone = r.camTrack.clone();
+    r.camClones.push(clone);
+    const rd = readable(clone, 1);
+    r.worker.postMessage({ type: 'source', key: 'cam', readable: rd }, [rd]);
   };
-  recorder.onstop = finishRecording;
+  const previewCtx = ui.livePreview.getContext('bitmaprenderer');
+  worker.onmessage = ({ data }) => {
+    if (data.type === 'preview') {
+      previewCtx.transferFromImageBitmap(data.bmp);
+      worker.postMessage({ type: 'preview-ack' });
+    }
+    else if (data.type === 'stats' && rec) {
+      rec.stats = data;
+      (rec.statsLog ||= []).push(data);
+      if (data.cam) rec.camProblem = null;
+      checkOverload(data);
+    }
+    else if (data.type === 'source-lost') {
+      if (data.key === 'cam') restartCam(data.reason);
+      else if (data.key === 'audio') setWarning(`Dźwięk przestał się nagrywać (${data.reason}). Obraz nagrywa się dalej.`);
+      else setWarning(`Przechwytywanie ekranu przerwane (${data.reason}).`);
+    }
+    else if (data.type === 'encoder-restart') {
+      setWarning(`Enkoder wideo zaciął się i został uruchomiony ponownie (${data.count}×). W nagraniu może być krótka przerwa. Jeśli to się powtarza, zmniejsz FPS do 30 albo rozdzielczość.`);
+    }
+    else if (data.type === 'started' && rec) {
+      // Zegar rusza dopiero, gdy enkoder faktycznie koduje (po rozgrzewce)
+      rec.codec = data;
+      rec.startedAt = performance.now();
+      rec.started = true;
+      setStatus('rec');
+      if (!rec.stopping) ui.pause.disabled = false;
+    }
+    else if (data.type === 'done') finishRecording(data);
+    else if (data.type === 'error') {
+      console.error('Recorder:', data.message);
+      if (rec && !rec.stopping) {
+        alert('Błąd nagrywania: ' + data.message);
+        stopRecording();
+      }
+    }
+  };
+  worker.onerror = (e) => {
+    console.error('Recorder worker:', e.message);
+    if (rec && !rec.stopping) { alert('Błąd nagrywania: ' + e.message); stopRecording(); }
+  };
+
   // Zatrzymanie udostępniania z paska Chrome kończy nagranie
-  (screenTrack || camStream.getVideoTracks()[0]).addEventListener('ended', () => stopRecording());
+  (screenTrack || camTrack).addEventListener('ended', () => stopRecording());
 
-  recorder.start(1000); // co sekundę kawałek na dysk
-  setStatus('rec');
-  ui.start.disabled = true; ui.pause.disabled = false; ui.stop.disabled = false;
+  setWarning(null);
+  ui.placeholder.classList.add('hidden');
+  ui.playback.classList.add('hidden');
+  ui.playback.pause();
+  ui.livePreview.classList.remove('hidden');
+  setStatus('starting');
+  ui.start.disabled = true; ui.pause.disabled = true; ui.stop.disabled = false; // pauza po rozgrzewce
   ui.pause.textContent = 'Pauza';
   rec.timerId = setInterval(updateTimer, 250);
 }
 
-function drawContain(ctx, s, x, y, w, h) {
-  const r = Math.min(w / s.w, h / s.h);
-  const dw = s.w * r, dh = s.h * r;
-  ctx.drawImage(s.img, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
-}
-function drawCover(ctx, s, x, y, w, h, mirror) {
-  const r = Math.max(w / s.w, h / s.h);
-  const sw = w / r, sh = h / r;
-  ctx.save();
-  if (mirror) { ctx.translate(x + w, y); ctx.scale(-1, 1); x = 0; y = 0; }
-  ctx.drawImage(s.img, (s.w - sw) / 2, (s.h - sh) / 2, sw, sh, x, y, w, h);
-  ctx.restore();
-}
-function drawCamBubble(ctx, k, W, H) {
-  const shape = $('camShape').value;
-  const pos = $('camPos').value;
-  const mirror = $('camMirror').value === '1';
-  const size = (Number($('camSize').value) / 100) * W;
-  const w = size, h = shape === 'circle' ? size : size * 9 / 16;
-  const m = Math.round(W * 0.02);
-  const x = pos.includes('r') ? W - w - m : m;
-  const y = pos.includes('b') ? H - h - m : m;
-  ctx.save();
-  ctx.beginPath();
-  if (shape === 'circle') ctx.arc(x + w / 2, y + h / 2, w / 2, 0, Math.PI * 2);
-  else ctx.roundRect(x, y, w, h, w * 0.04);
-  ctx.closePath();
-  ctx.save();
-  ctx.clip();
-  drawCover(ctx, k, x, y, w, h, mirror);
-  ctx.restore();
-  ctx.lineWidth = Math.max(3, W * 0.0025);
-  ctx.strokeStyle = '#6d4aff';
-  ctx.stroke();
-  ctx.restore();
+// Przeciążenie: przez 3 sekundy z rzędu pominięto ponad 10% klatek
+function checkOverload(s) {
+  const fps = Number($('optFps').value);
+  rec.overloadSecs = s.dropped > fps * 0.1 ? (rec.overloadSecs || 0) + 1 : 0;
+  if (rec.overloadSecs === 3) {
+    const hint = fps > 30 ? 'zmniejsz FPS do 30' : 'zmniejsz rozdzielczość albo bitrate';
+    setWarning(`Komputer nie nadąża: pomijanych jest ok. ${s.dropped} klatek na sekundę. Przy następnym nagraniu ${hint}.`);
+  }
 }
 
 function updateTimer() {
-  if (!rec) return;
+  if (!rec?.started) return;
   const now = rec.pausedAt || performance.now();
   ui.timer.textContent = fmtTime(now - rec.startedAt - rec.pausedMs);
-  ui.liveInfo.innerHTML = `${rec.out.w}×${rec.out.h} · ${$('optFps').value} fps · ${fmtBytes(rec.bytes)}<br>${rec.writable ? 'zapis na dysk na żywo' : 'w pamięci, pobranie po Stop'}${rec.direct ? ' · 1:1' : ''}`;
+  const s = rec.stats;
+  if (!s) return;
+  // Licznik klatek kamerki: od razu widać, gdy kamerka przestaje dostarczać obraz
+  const camInfo = rec.hasCam
+    ? ` · <span class="${s.cam && !rec.camProblem ? 'text-mint' : 'text-coral'}">kamerka ${rec.camProblem || (s.cam ? s.cam + ' fps' : 'brak obrazu')}</span>`
+    : '';
+  const hw = rec.codec?.hw === 'prefer-hardware' ? 'sprzętowo' : 'programowo';
+  // Prawdziwa rozdzielczość źródeł: przy powiększeniu plik ma więcej pikseli, ale nie więcej szczegółów
+  const src = [
+    rec.srcInfo.screen && `ekran ${rec.srcInfo.screen}${rec.srcInfo.upscaled ? ' <span class="text-sun">(powiększany)</span>' : ''}`,
+    rec.srcInfo.cam && `kamerka ${rec.srcInfo.cam}`,
+  ].filter(Boolean).join(' · ');
+  ui.liveInfo.innerHTML = `${rec.out.w}×${rec.out.h} · ${s.out} fps · ${fmtBytes(s.bytes)}${camInfo}<br>${src}<br>${rec.fileHandle ? 'zapis na dysk na żywo' : 'w pamięci, pobranie po Stop'} · H.264 ${hw}`;
 }
 
 function togglePause() {
-  if (!rec) return;
-  if (rec.recorder.state === 'recording') {
-    rec.recorder.pause(); rec.pausedAt = performance.now();
+  if (!rec || rec.stopping) return;
+  if (!rec.pausedAt) {
+    rec.worker.postMessage({ type: 'pause' }); rec.pausedAt = performance.now();
     setStatus('paused'); ui.pause.textContent = 'Wznów';
-  } else if (rec.recorder.state === 'paused') {
-    rec.recorder.resume(); rec.pausedMs += performance.now() - rec.pausedAt; rec.pausedAt = 0;
+  } else {
+    rec.worker.postMessage({ type: 'resume' }); rec.pausedMs += performance.now() - rec.pausedAt; rec.pausedAt = 0;
     setStatus('rec'); ui.pause.textContent = 'Pauza';
   }
 }
 
 function stopRecording() {
-  if (!rec || rec.recorder.state === 'inactive') return;
+  if (!rec || rec.stopping) return;
+  rec.stopping = true;
   setStatus('saving');
   ui.pause.disabled = true; ui.stop.disabled = true;
-  rec.recorder.stop();
+  clearInterval(rec.timerId);
+  rec.worker.postMessage({ type: 'stop' });
 }
 
-async function finishRecording() {
+async function finishRecording(result) {
   const r = rec;
-  clearInterval(r.timerId);
-  r.ticker?.terminate();
-  r.sources.forEach((s) => s.stop());
   r.streams.forEach((s) => s.getTracks().forEach((t) => t.stop()));
+  r.camClones.forEach((t) => t.stop());
   r.audioCtx?.close();
-  ui.canvas.classList.add('hidden');
-  ui.directPreview.classList.add('hidden');
-  ui.directPreview.srcObject = null;
+  ui.livePreview.classList.add('hidden');
 
   let url, file;
   try {
-    if (r.writable) {
-      await r.writeQueue;
-      await r.writable.close();
+    if (result.failed) {
+      if (r.fileHandle) await dirHandle.removeEntry(r.name).catch(() => {});
+    } else if (r.fileHandle) {
       file = await r.fileHandle.getFile();
     } else {
-      file = new File(r.chunks, r.name, { type: mimeType || 'video/webm' });
+      file = new File([result.blob], r.name, { type: 'video/mp4' });
       const a = document.createElement('a');
       a.href = URL.createObjectURL(file); a.download = r.name;
       document.body.appendChild(a); a.click(); a.remove();
     }
-    url = URL.createObjectURL(file);
+    if (file) url = URL.createObjectURL(file);
   } catch (e) {
     alert('Błąd zapisu: ' + e.message);
   }
@@ -603,7 +689,7 @@ function addToList(r, file, url) {
   li.innerHTML = `
     <span class="font-bold text-white">${r.name}</span>
     <span class="text-gray-400">${ui.timer.textContent} · ${r.out.w}×${r.out.h} · ${fmtBytes(file.size)}</span>
-    <span class="text-xs ${r.writable ? 'text-mint' : 'text-gray-400'}">${r.writable ? 'zapisano w: ' + dirHandle.name : 'pobrano'}</span>
+    <span class="text-xs ${r.fileHandle ? 'text-mint' : 'text-gray-400'}">${r.fileHandle ? 'zapisano w: ' + dirHandle.name : 'pobrano'}</span>
     <span class="ml-auto flex gap-2">
       <button class="play rounded-lg bg-ink-3 px-3 py-1.5 font-bold hover:bg-ink-2">Odtwórz</button>
       <a class="rounded-lg bg-brand px-3 py-1.5 font-bold text-white hover:bg-brand-dark" href="${url}" download="${r.name}">Pobierz</a>
@@ -620,11 +706,12 @@ ui.pause.onclick = togglePause;
 ui.stop.onclick = stopRecording;
 window.addEventListener('beforeunload', (e) => { if (rec) { e.preventDefault(); e.returnValue = ''; } });
 
-if (!navigator.mediaDevices?.getDisplayMedia) {
+if (!navigator.mediaDevices?.getDisplayMedia || !supported) {
   ui.start.disabled = true;
   ui.placeholder.innerHTML = '<p class="p-6 text-center font-bold text-coral">Ta przeglądarka nie obsługuje nagrywania ekranu. Użyj Chrome albo Edge na komputerze.</p>';
 }
 syncOptionUI();
+markPreset('custom');
 listDevices();
 restoreFolder();
 </script>
