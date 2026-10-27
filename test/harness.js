@@ -91,7 +91,7 @@
     await new Promise((r) => (v.onloadedmetadata = r));
     const c = document.createElement('canvas'); c.width = 256; c.height = 144;
     const g = c.getContext('2d', { willReadFrequently: true });
-    const box = [196, 86, 54, 54]; // obszar kółka przy domyślnych ustawieniach (22%, prawy dół)
+    const box = [222, 110, 26, 26]; // obszar kółka przy domyślnych ustawieniach (12%, prawy dół)
     let prev = null; const frozen = []; let samples = 0;
     for (let t = step; t < v.duration - 0.1; t += step) {
       v.currentTime = t; await new Promise((r) => { v.onseeked = r; setTimeout(r, 2000); });

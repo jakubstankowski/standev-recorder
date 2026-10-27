@@ -26,9 +26,10 @@
 </script>
 <style>
   body { background: #12121f; }
-  .toggle input:checked + span { background: #6d4aff; border-color: #6d4aff; }
-  .toggle input:checked + span::after { transform: translateX(18px); }
-  .toggle span::after { content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 9999px; background: #fff; transition: transform .15s; }
+  /* Tylko suwak przełącznika (.switch); wcześniej kółko dostawał też napis obok i lądowało w rogu strony */
+  .toggle input:checked + .switch { background: #6d4aff; border-color: #6d4aff; }
+  .toggle input:checked + .switch::after { transform: translateX(18px); }
+  .toggle .switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 9999px; background: #fff; transition: transform .15s; }
   @keyframes pulse-dot { 0%,100% { opacity: 1 } 50% { opacity: .3 } }
   .rec-dot { animation: pulse-dot 1.2s infinite; }
   select, input[type=range] { accent-color: #6d4aff; }
@@ -103,23 +104,23 @@
             <label class="toggle flex cursor-pointer items-center justify-between">
               <span class="font-semibold">Ekran</span>
               <input id="optScreen" type="checkbox" class="sr-only" checked>
-              <span class="relative h-5 w-[38px] rounded-full border border-white/10 bg-ink-3 transition"></span>
+              <span class="switch relative h-5 w-[38px] rounded-full border border-white/10 bg-ink-3 transition"></span>
             </label>
             <label class="toggle flex cursor-pointer items-center justify-between">
               <span class="font-semibold">Dźwięk systemowy</span>
               <input id="optSysAudio" type="checkbox" class="sr-only" checked>
-              <span class="relative h-5 w-[38px] rounded-full border border-white/10 bg-ink-3 transition"></span>
+              <span class="switch relative h-5 w-[38px] rounded-full border border-white/10 bg-ink-3 transition"></span>
             </label>
             <label class="toggle flex cursor-pointer items-center justify-between">
               <span class="font-semibold">Mikrofon</span>
               <input id="optMic" type="checkbox" class="sr-only" checked>
-              <span class="relative h-5 w-[38px] rounded-full border border-white/10 bg-ink-3 transition"></span>
+              <span class="switch relative h-5 w-[38px] rounded-full border border-white/10 bg-ink-3 transition"></span>
             </label>
             <select id="micDevice" class="w-full rounded-lg border border-white/10 bg-ink-2 px-3 py-2 text-sm"></select>
             <label class="toggle flex cursor-pointer items-center justify-between">
               <span class="font-semibold">Kamerka</span>
               <input id="optCam" type="checkbox" class="sr-only">
-              <span class="relative h-5 w-[38px] rounded-full border border-white/10 bg-ink-3 transition"></span>
+              <span class="switch relative h-5 w-[38px] rounded-full border border-white/10 bg-ink-3 transition"></span>
             </label>
             <select id="camDevice" class="w-full rounded-lg border border-white/10 bg-ink-2 px-3 py-2 text-sm"></select>
           </div>
@@ -144,8 +145,8 @@
                 <option value="1">Tak</option><option value="0">Nie</option>
               </select>
             </label>
-            <label class="col-span-2">Rozmiar <span id="camSizeVal" class="text-gray-400">22%</span>
-              <input id="camSize" type="range" min="10" max="45" value="22" class="mt-1 w-full">
+            <label class="col-span-2">Rozmiar <span id="camSizeVal" class="text-gray-400">12%</span>
+              <input id="camSize" type="range" min="5" max="45" value="12" class="mt-1 w-full">
             </label>
           </div>
         </div>
@@ -365,9 +366,27 @@ function camOpts() {
     camSize: Number($('camSize').value),
   };
 }
-['camPos', 'camShape', 'camMirror', 'camSize'].forEach((id) => $(id).addEventListener('input', () => {
+// Ustawienia nakładki kamerki są zapamiętywane w przeglądarce (try/catch: w trybie
+// prywatnym albo przy zablokowanych danych strony localStorage potrafi rzucać wyjątkiem)
+const CAM_FIELDS = ['camPos', 'camShape', 'camMirror', 'camSize'];
+const CAM_STORE_KEY = 'standev-recorder.cam';
+function restoreCamSettings() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(CAM_STORE_KEY) || '{}');
+    CAM_FIELDS.forEach((id) => { if (saved[id] != null) $(id).value = saved[id]; });
+  } catch {}
+  $('camSizeVal').textContent = $('camSize').value + '%';
+}
+function saveCamSettings() {
+  try {
+    localStorage.setItem(CAM_STORE_KEY, JSON.stringify(Object.fromEntries(CAM_FIELDS.map((id) => [id, $(id).value]))));
+  } catch {}
+}
+CAM_FIELDS.forEach((id) => $(id).addEventListener('input', () => {
+  saveCamSettings();
   rec?.worker.postMessage({ type: 'opts', opts: camOpts() });
 }));
+restoreCamSettings();
 // Podgląd jest potrzebny tylko, gdy karta jest widoczna; w tle nie zapychamy głównego wątku
 document.addEventListener('visibilitychange', () => {
   rec?.worker.postMessage({ type: 'preview', on: !document.hidden });
