@@ -163,6 +163,13 @@
               </select>
               <span class="mt-1 block text-xs text-gray-500">Powiększanie daje więcej pikseli w pliku, ale nie więcej szczegółów.</span>
             </label>
+            <label class="col-span-2">Kadr
+              <select id="optFrame" class="mt-1 w-full rounded-lg border border-white/10 bg-ink-2 px-3 py-2">
+                <option value="source" selected>Proporcje źródła</option>
+                <option value="fill">16:9, wypełnij cały kadr</option>
+              </select>
+              <span class="mt-1 block text-xs text-gray-500">16:9 przycina brzegi źródła, które nie ma 16:9, zamiast dodawać czarne pasy. Z „Zawsze 2K” daje 2560×1440.</span>
+            </label>
             <label>FPS
               <select id="optFps" class="mt-1 w-full rounded-lg border border-white/10 bg-ink-2 px-3 py-2">
                 <option value="60" selected>60</option><option value="30">30</option>
@@ -311,8 +318,8 @@ function fmtBytes(b) {
   return b > 1e9 ? (b / 1e9).toFixed(2) + ' GB' : (b / 1e6).toFixed(1) + ' MB';
 }
 
-function targetSize(nativeW, nativeH, mode) {
-  const ratio = nativeW / nativeH;
+function targetSize(nativeW, nativeH, mode, fill) {
+  const ratio = fill ? 16 / 9 : nativeW / nativeH;
   let h;
   if (mode === 'native') h = nativeH;
   else if (mode === 'min1440') h = Math.max(nativeH, 1440);
@@ -382,6 +389,11 @@ function saveCamSettings() {
     localStorage.setItem(CAM_STORE_KEY, JSON.stringify(Object.fromEntries(CAM_FIELDS.map((id) => [id, $(id).value]))));
   } catch {}
 }
+const FRAME_STORE_KEY = 'standev-recorder.frame';
+try { $('optFrame').value = localStorage.getItem(FRAME_STORE_KEY) || 'source'; } catch {}
+$('optFrame').addEventListener('change', () => {
+  try { localStorage.setItem(FRAME_STORE_KEY, $('optFrame').value); } catch {}
+});
 CAM_FIELDS.forEach((id) => $(id).addEventListener('input', () => {
   saveCamSettings();
   rec?.worker.postMessage({ type: 'opts', opts: camOpts() });
@@ -499,7 +511,10 @@ async function launchRecording({ screenStream, camStream, micStream, streams, fp
   const screenTrack = screenStream?.getVideoTracks()[0];
   const camTrack = camStream?.getVideoTracks()[0];
   const nativeSettings = (screenTrack || camTrack).getSettings();
-  const out = targetSize(nativeSettings.width || 1920, nativeSettings.height || 1080, resMode);
+  // Wypełnianie 16:9 dotyczy ekranu; sama kamerka zostaje w swoich proporcjach
+  const fill = !!screenTrack && $('optFrame').value === 'fill';
+  const nativeW = nativeSettings.width || 1920, nativeH = nativeSettings.height || 1080;
+  const out = targetSize(nativeW, nativeH, resMode, fill);
 
   // --- Audio: dźwięk systemowy i mikrofon zawsze przez AudioContext (stałe 48 kHz stereo) ---
   const audioInputs = [screenStream, micStream].filter((s) => s && s.getAudioTracks().length);
@@ -530,7 +545,7 @@ async function launchRecording({ screenStream, camStream, micStream, streams, fp
     type: 'start', width: out.w, height: out.h, fps,
     bitrate: Number($('optBitrate').value) * 1_000_000,
     screen, cam, audio, audioInfo: { sampleRate: 48000, channels: 2 }, fileHandle,
-    opts: { ...camOpts(), hasScreen: !!screenTrack },
+    opts: { ...camOpts(), hasScreen: !!screenTrack, fill },
   }, [screen, cam, audio].filter(Boolean));
 
   const camSet = camTrack?.getSettings();
@@ -540,7 +555,8 @@ async function launchRecording({ screenStream, camStream, micStream, streams, fp
     camTrack, camClones: [], camRestarts: 0, camProblem: null,
     srcInfo: {
       screen: screenTrack && nativeSettings.width && `${nativeSettings.width}×${nativeSettings.height}`,
-      upscaled: !!nativeSettings.height && out.h > nativeSettings.height,
+      // Przy wypełnianiu obraz skaluje się po dłuższym z boków (patrz drawCover w workerze)
+      upscaled: !!nativeSettings.height && (fill ? Math.max(out.w / nativeW, out.h / nativeH) : out.h / nativeH) > 1.01,
       cam: camSet?.width && `${camSet.width}×${camSet.height} @${Math.round(camSet.frameRate || 0)}`,
     },
   };

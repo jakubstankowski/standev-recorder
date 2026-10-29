@@ -153,7 +153,10 @@ function tick() {
   const W = canvas.width, H = canvas.height;
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, W, H);
-  if (latest.screen) drawContain(latest.screen, 0, 0, W, H);
+  if (latest.screen) {
+    if (opts.fill) drawCover(latest.screen, 0, 0, W, H, false);
+    else drawContain(latest.screen, 0, 0, W, H);
+  }
   if (latest.cam) {
     if (!opts.hasScreen) drawCover(latest.cam, 0, 0, W, H, opts.camMirror);
     else drawCamBubble(latest.cam, W, H);
