@@ -208,6 +208,17 @@ function extractAudio(data) {
   return buf;
 }
 
+// Enkoder (zwłaszcza sprzętowy) potrafi oddać fragment z duration === null, a muxer wymaga
+// liczby ≥ 0 i przerywał nagranie błędem. Brakującą długość uzupełniamy nominalną wartością.
+function addChunk(kind, chunk, meta, fallbackDuration) {
+  const data = new Uint8Array(chunk.byteLength);
+  chunk.copyTo(data);
+  const d = chunk.duration;
+  const duration = Number.isFinite(d) && d >= 0 ? d : fallbackDuration;
+  if (kind === 'video') muxer.addVideoChunkRaw(data, chunk.type, chunk.timestamp, duration, meta);
+  else muxer.addAudioChunkRaw(data, chunk.type, chunk.timestamp, duration, meta);
+}
+
 function createVideoEncoder() {
   videoEncoder = new VideoEncoder({
     output: (chunk, meta) => {
@@ -226,7 +237,7 @@ function createVideoEncoder() {
       }
       counts.encoded++;
       bytes += chunk.byteLength;
-      try { muxer.addVideoChunk(chunk, meta); } catch (e) { fail(e); }
+      try { addChunk('video', chunk, meta, 1e6 / opts.fps); } catch (e) { fail(e); }
     },
     error: (e) => { console.warn('Enkoder wideo:', e); restartVideoEncoder(); },
   });
@@ -326,7 +337,7 @@ async function start(d) {
         // przekazuje jako ogromną liczbę; muxer by ich nie przyjął, więc je pomijamy
         if (chunk.timestamp < 0 || chunk.timestamp > Number.MAX_SAFE_INTEGER) return;
         bytes += chunk.byteLength;
-        try { muxer.addAudioChunk(chunk, meta); } catch (e) { console.warn('Audio chunk pominięty:', e.message); }
+        try { addChunk('audio', chunk, meta, (1024 / acodec.cfg.sampleRate) * 1e6); } catch (e) { console.warn('Audio chunk pominięty:', e.message); }
       },
       error: fail,
     });
